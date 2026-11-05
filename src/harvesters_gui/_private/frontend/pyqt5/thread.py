@@ -64,7 +64,9 @@ class _PyQtThread(ThreadBase):
         return self._is_running
 
     def join(self):
-        pass
+        # ThreadBase uses join() as the synchronization point when stopping
+        # its worker. QThread.wait() blocks until run() has returned.
+        self._thread.wait()
 
     def _internal_stop(self):
         self._thread.stop()

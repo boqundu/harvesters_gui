@@ -32,21 +32,25 @@ import versioneer as versioneer
 #
 log.set_verbosity(log.DEBUG)
 log.info('Entered setup.py')
-log.info('$PATH=%s' % os.environ['PATH'])
+log.info('$PATH=%s' % os.environ.get('PATH', ''))
 
 
 # Check the Python version:
 supported_versions = [(3, 5), (3, 6), (3, 7), (3, 8)]
-if sys.version_info in supported_versions:
+if tuple(sys.version_info[:2]) not in supported_versions:
     raise RuntimeError(
-        'See https://github.com/genicam/harvesters_gui#requirements'
+        'Unsupported Python version: {0}.{1}. '
+        'Harvester GUI requires Python >= 3.5 and < 3.9. '
+        'See https://github.com/genicam/harvesters_gui#requirements'.format(
+            sys.version_info.major, sys.version_info.minor
+        )
     )
 
 
 with open('README.rst', 'r',encoding='utf-8_sig') as fh:
     __doc__ = fh.read()
 
-description = 'Graphical user interfce of Harvester'
+description = 'Graphical user interface of Harvester'
 
 # Determine the base directory:
 base_dir = os.path.dirname(__file__)

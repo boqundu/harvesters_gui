@@ -36,7 +36,7 @@ class ComboBoxDisplayRateList(QComboBox):
         self.setFont(get_system_font())
         for d in self._dict_disp_rates:
             self.addItem(d)
-        self.setCurrentIndex(self._dict_disp_rates['30 fps'])
+        self.setCurrentIndex(self._dict_disp_rates['60 fps'])
         self.currentTextChanged.connect(self._set_display_rate)
 
     def _set_display_rate(self, value):

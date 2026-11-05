@@ -22,6 +22,9 @@
 
 # Related third party imports
 
+import time
+import threading
+
 import numpy as np
 
 from vispy import gloo
@@ -47,7 +50,7 @@ class CanvasBase(app.Canvas):
             self, *,
             image_acquirer=None,
             width=640, height=480,
-            display_rate=30.,
+            display_rate=60.,
             background_color='gray',
             vsync=True
     ):
@@ -90,6 +93,27 @@ class CanvasBase(app.Canvas):
         #
         self._buffers = []
 
+        # Acquisition statistics are measured from buffers fetched from the
+        # ImageAcquirer, independently of the canvas refresh rate.
+        self._statistics_lock = threading.Lock()
+        self._statistics_last_time = None
+        self._statistics_interval_frames = 0
+        self._statistics_interval_bytes = 0
+        self._statistics_fps = 0.0
+        self._statistics_bandwidth = 0.0
+        self._statistics_min_fps = None
+        self._statistics_max_fps = None
+        self._statistics_min_bandwidth = None
+        self._statistics_max_bandwidth = None
+        # Display FPS statistics.
+        self._display_last_time = None
+        self._display_interval_frames = 0
+        self._display_fps = 0.0
+        # Fit the complete image into the available canvas until the user
+        # changes magnification manually.
+        self._fit_to_window = True
+        self._user_zoom = 1.0
+
     @property
     def display_rate(self):
         return self._display_rate
@@ -117,6 +141,144 @@ class CanvasBase(app.Canvas):
         if updated:
             self.apply_magnification()
 
+    def reset_statistics(self):
+        now = time.perf_counter()
+
+        with self._statistics_lock:
+            # Acquisition statistics.
+            self._statistics_last_time = now
+            self._statistics_interval_frames = 0
+            self._statistics_interval_bytes = 0
+            self._statistics_fps = None
+            self._statistics_bandwidth = None
+            self._statistics_min_fps = None
+            self._statistics_max_fps = None
+            self._statistics_min_bandwidth = None
+            self._statistics_max_bandwidth = None
+
+            # Display statistics.
+            self._display_last_time = now
+            self._display_interval_frames = 0
+            self._display_fps = None
+
+    @staticmethod
+    def _get_buffer_payload_size(buffer):
+        """Return the number of image payload bytes represented by a buffer."""
+        payload = getattr(buffer, 'payload', None)
+        if payload is None:
+            return 0
+
+        # Prefer a producer-reported payload size when available.
+        for owner in (buffer, payload):
+            for name in ('payload_size', 'size'):
+                value = getattr(owner, name, None)
+                if isinstance(value, (int, np.integer)) and value >= 0:
+                    return int(value)
+
+        # Fall back to the actual component arrays. This also supports
+        # multipart payloads.
+        raw_buffer = getattr(payload, 'raw_buffer', None)
+        if raw_buffer is not None:
+            try:
+                return int(np.asarray(raw_buffer).nbytes)
+            except (TypeError, ValueError):
+                pass
+
+        total = 0
+        for component in getattr(payload, 'components', ()):
+            data = getattr(component, 'data', None)
+            if data is not None:
+                total += int(np.asarray(data).nbytes)
+        return total
+
+    def _record_acquired_buffer(self, buffer):
+        now = time.perf_counter()
+        payload_size = self._get_buffer_payload_size(buffer)
+        with self._statistics_lock:
+            self._statistics_interval_frames += 1
+            self._statistics_interval_bytes += payload_size
+            if self._statistics_last_time is None:
+                self._statistics_last_time = now
+
+    def get_statistics(self):
+        """Return (instant fps, min fps, max fps, MB/s, min MB/s, max MB/s)."""
+        now = time.perf_counter()
+
+        with self._statistics_lock:
+            if self._statistics_last_time is None:
+                self._statistics_last_time = now
+
+            elapsed = now - self._statistics_last_time
+
+            if elapsed > 0 and self._statistics_interval_frames > 0:
+                fps = self._statistics_interval_frames / elapsed
+                bandwidth = (
+                    self._statistics_interval_bytes / elapsed / 1000000.0
+                )
+
+                self._statistics_fps = fps
+                self._statistics_bandwidth = bandwidth
+
+                # Initialize Min/Max with the first valid sample.
+                if self._statistics_min_fps is None:
+                    self._statistics_min_fps = fps
+                    self._statistics_max_fps = fps
+                    self._statistics_min_bandwidth = bandwidth
+                    self._statistics_max_bandwidth = bandwidth
+                else:
+                    self._statistics_min_fps = min(
+                        self._statistics_min_fps, fps
+                    )
+                    self._statistics_max_fps = max(
+                        self._statistics_max_fps, fps
+                    )
+                    self._statistics_min_bandwidth = min(
+                        self._statistics_min_bandwidth, bandwidth
+                    )
+                    self._statistics_max_bandwidth = max(
+                        self._statistics_max_bandwidth, bandwidth
+                    )
+
+                # Reset the sampling interval.
+                self._statistics_interval_frames = 0
+                self._statistics_interval_bytes = 0
+                self._statistics_last_time = now
+
+            return (
+                self._statistics_fps or 0.0,
+                self._statistics_min_fps or 0.0,
+                self._statistics_max_fps or 0.0,
+                self._statistics_bandwidth or 0.0,
+                self._statistics_min_bandwidth or 0.0,
+                self._statistics_max_bandwidth or 0.0,
+            )
+
+    def _record_displayed_frame(self):
+        """Record one successfully displayed image."""
+        with self._statistics_lock:
+            self._display_interval_frames += 1
+
+    def get_display_fps(self):
+        """Return the instantaneous GUI display frame rate."""
+        now = time.perf_counter()
+
+        with self._statistics_lock:
+            if self._display_last_time is None:
+                self._display_last_time = now
+                return 0.0
+
+            elapsed = now - self._display_last_time
+
+            if elapsed > 0:
+                self._display_fps = (
+                    self._display_interval_frames / elapsed
+                )
+
+                self._display_interval_frames = 0
+                self._display_last_time = now
+
+            return self._display_fps
+
     def on_draw(self, event):
         # Update on June 15th, 2018:
         # According to a VisPy developer, they have not finished
@@ -130,42 +292,55 @@ class CanvasBase(app.Canvas):
         gloo.clear(color=self._background_color)
 
         drew = False
+        latest_buffer = None
+
+        if self._pause_drawing:
+            # The previously displayed buffer is no longer needed while
+            # drawing is paused.
+            self.release_buffers()
+
+        # Drain all buffers currently available. Otherwise a 30/60 Hz display
+        # loop can silently limit the measured/consumed frame rate of a faster
+        # camera and let the input queue grow.
         try:
-            if not self._pause_drawing:
-                # Fetch a buffer.
-                buffer = self.ia.fetch(timeout=0.0001)
+            while self.ia is not None:
+                try:
+                    buffer = self.ia.fetch(timeout=0.0001)
+                except TimeoutException:
+                    break
 
-                # Prepare a texture to draw:
-                self._prepare_texture(buffer)
+                self._record_acquired_buffer(buffer)
 
-                # Draw the texture until the buffer object exists
-                # within this scope:
-                # (We keep the buffer until the next one is delivered to
-                # keep the current chunk data alive but it depends on the
-                # application; we just want to tell you that the texture
-                # must be overdrawn until the content is alive:)
-                self._draw()
+                if self._pause_drawing:
+                    buffer.queue()
+                    continue
 
-                # Release the buffers that we've kept holding so far:
-                self.release_buffers()
-
-                # We have drawn the latest image on the canvas:
-                drew = True
-
-                # Keep the buffer alive to keep the chunk data alive until
-                # the next one is delivered:
-                self._buffers.append(buffer)
+                # Keep only the newest frame for display. Older buffers are
+                # queued immediately so that they cannot exhaust the pool.
+                if latest_buffer is not None:
+                    latest_buffer.queue()
+                latest_buffer = buffer
 
         except AttributeError:
-            # Calling fetch_buffer() raises AttributeError because
-            # the ImageAcquirer object is None.
-            pass
-        except TimeoutException:
-            # We have an ImageAcquirer object but nothing has
-            # been fetched, wait for the next round:
+            # No ImageAcquirer is connected.
             pass
 
-        # Draw the latest texture again if needed:
+        if latest_buffer is not None:
+            try:
+                self._prepare_texture(latest_buffer)
+                self._draw()
+                drew = True
+                # Count only successfully displayed images.
+                self._record_displayed_frame()
+            except Exception:
+                latest_buffer.queue()
+                raise
+            else:
+                # Retain the displayed buffer until the next frame so chunk
+                # data remains valid for the texture's lifetime.
+                self.release_buffers()
+                self._buffers.append(latest_buffer)
+
         if not drew:
             self._draw()
 
@@ -241,7 +416,7 @@ class Canvas2D(CanvasBase):
             image_acquirer=None,
             width=640, height=480,
             background_color='gray',
-            vsync=True, display_rate=30.
+            vsync=True, display_rate=60.
     ):
         #
         super().__init__(
@@ -326,76 +501,81 @@ class Canvas2D(CanvasBase):
         self.apply_magnification()
 
     def _prepare_texture(self, buffer):
+        if not buffer or buffer.payload_type not in self._visible_payloads:
+            return
+
+        # Some payload types (for example chunk-only data) may not contain an
+        # image component. Do not index an empty component list.
+        payload = buffer.payload
+        components = getattr(payload, 'components', None)
+        if not components:
+            return
+
         update = True
-        if buffer.payload_type not in self._visible_payloads:
+        component = components[0]
+        width = component.width
+        height = component.height
+
+        # Update the canvas size if needed.
+        self.set_canvas_size(width, height)
+
+        #
+        exponent = 0
+        data_format = None
+
+        #
+        data_format_value = component.data_format_value
+        if is_custom(data_format_value):
             update = False
-
-        # Set the image as the texture of our canvas.
-        if buffer:
-            #
-            payload = buffer.payload
-            component = payload.components[0]
-            width = component.width
-            height = component.height
-
-            # Update the canvas size if needed.
-            self.set_canvas_size(width, height)
-
-            #
-            exponent = 0
-            data_format = None
-
-            #
-            data_format_value = component.data_format_value
-            if is_custom(data_format_value):
-                update = False
+        else:
+            data_format = component.data_format
+            bpp = get_bits_per_pixel(data_format)
+            if bpp is not None:
+                exponent = bpp - 8
             else:
-                data_format = component.data_format
-                bpp = get_bits_per_pixel(data_format)
-                if bpp is not None:
-                    exponent = bpp - 8
-                else:
-                    update = False
+                update = False
 
-            if update:
-                # Reshape the image so that it can be drawn on the
-                # VisPy canvas:
-                if data_format in mono_location_formats or \
-                        data_format in bayer_location_formats:
+        if update:
+            # Reshape the image so that it can be drawn on the
+            # VisPy canvas:
+            if data_format in mono_location_formats or \
+                    data_format in bayer_location_formats:
+                # Reshape the 1D NumPy array into a 2D so that VisPy
+                # can display it as a mono image:
+                content = component.data.reshape(height, width)
+            else:
+                # The image requires you to reshape it to draw it on the
+                # canvas:
+                if data_format in rgb_formats or \
+                        data_format in rgba_formats or \
+                        data_format in bgr_formats or \
+                        data_format in bgra_formats:
                     # Reshape the 1D NumPy array into a 2D so that VisPy
-                    # can display it as a mono image:
-                    content = component.data.reshape(height, width)
+                    # can display it as an RGB image:
+                    content = component.data.reshape(
+                        height, width,
+                        int(component.num_components_per_pixel)
+                    )
+                    #
+                    if data_format in bgr_formats:
+                        # Swap red and blue channels.
+                        content = content[:, :, [2, 1, 0]]
+                    elif data_format in bgra_formats:
+                        # Swap red and blue while keeping alpha in place.
+                        content = content[:, :, [2, 1, 0, 3]]
                 else:
-                    # The image requires you to reshape it to draw it on the
-                    # canvas:
-                    if data_format in rgb_formats or \
-                            data_format in rgba_formats or \
-                            data_format in bgr_formats or \
-                            data_format in bgra_formats:
-                        # Reshape the 1D NumPy array into a 2D so that VisPy
-                        # can display it as an RGB image:
-                        content = component.data.reshape(
-                            height, width,
-                            int(component.num_components_per_pixel)
-                        )
-                        #
-                        if data_format in bgr_formats:
-                            # Swap every R and B so that VisPy can display
-                            # it as an RGB image:
-                            content = content[:, :, ::-1]
-                    else:
-                        return
+                    return
 
-                # Convert each data to an 8bit.
-                if exponent > 0:
-                    # The following code may affect to the rendering
-                    # performance:
-                    content = (content / (2 ** exponent))
+            # Convert each data to an 8bit.
+            if exponent > 0:
+                # The following code may affect to the rendering
+                # performance:
+                content = (content / (2 ** exponent))
 
-                    # Then cast each array element to an uint8:
-                    content = content.astype(np.uint8)
+                # Then cast each array element to an uint8:
+                content = content.astype(np.uint8)
 
-                self._program['texture'] = content
+            self._program['texture'] = content
 
     def _draw(self):
         self._program.draw('triangle_strip')
@@ -406,9 +586,18 @@ class Canvas2D(CanvasBase):
         gloo.set_viewport(0, 0, canvas_w, canvas_h)
 
         #
-        ratio = self._magnification
         w, h = self._width, self._height
+        if w <= 0 or h <= 0 or canvas_w <= 0 or canvas_h <= 0:
+            return
 
+        if self._fit_to_window:
+            fit_scale = min(float(canvas_w) / w, float(canvas_h) / h)
+            ratio = 1.0 / fit_scale
+        else:
+            fit_scale = min(float(canvas_w) / w, float(canvas_h) / h)
+            ratio = 1.0 / (fit_scale * self._user_zoom)
+
+        self._magnification = ratio
         self._program['u_projection'] = ortho(
             self._coordinate[0],
             canvas_w * ratio + self._coordinate[0],
@@ -417,7 +606,8 @@ class Canvas2D(CanvasBase):
             -1, 1
         )
 
-        x, y = int((canvas_w * ratio - w) / 2), int((canvas_h * ratio - h) / 2)  # centering x & y
+        x = int((canvas_w * ratio - w) / 2)
+        y = int((canvas_h * ratio - h) / 2)
 
         #
         self._data['a_position'] = np.array(
@@ -429,13 +619,13 @@ class Canvas2D(CanvasBase):
 
     def on_mouse_wheel(self, event):
         self._translate += event.delta[1]
-        power = 7. if is_running_on_macos() else 5.  # 2 ** exponent
+        power = 7. if is_running_on_macos() else 5.
         stride = 4. if is_running_on_macos() else 7.
-        translate = self._translate
-        translate = min(power * stride, translate)
+        translate = min(power * stride, self._translate)
         translate = max(-power * stride, translate)
         self._translate = translate
-        self._magnification = 2 ** -(self._translate / stride)
+        self._user_zoom = 2 ** (self._translate / stride)
+        self._fit_to_window = False
         if self._latest_translate != self._translate:
             self.apply_magnification()
             self._latest_translate = self._translate

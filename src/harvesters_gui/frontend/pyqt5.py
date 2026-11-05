@@ -111,14 +111,29 @@ class Harvester(QMainWindow):
     def update_statistics(self, message):
         self.statusBar().showMessage(message)
 
-    def closeEvent(self, QCloseEvent):
-        #
+    def closeEvent(self, event):
+        # Stop the statistics worker before destroying the ImageAcquirer.
+        if self._thread_statistics_measurement.is_running():
+            self._thread_statistics_measurement.stop()
+
+        if self.ia is not None:
+            self.canvas.release_buffers()
+            try:
+                if self.ia.is_acquiring():
+                    self.ia.stop()
+            except Exception:
+                self._logger.exception('Failed to stop image acquisition on close.')
+
         if self._widget_attribute_controller:
             self._widget_attribute_controller.close()
+            self._widget_attribute_controller = None
 
-        #
         if self._harvester_core:
             self._harvester_core.reset()
+
+        self._ia = None
+        self.canvas.ia = None
+        super().closeEvent(event)
 
     def __enter__(self):
         return self
@@ -514,15 +529,30 @@ class Harvester(QMainWindow):
         return enable
 
     def action_on_disconnect(self):
-        if self.attribute_controller:
-            if self.attribute_controller.isVisible():
-                self.attribute_controller.close()
-                self._widget_attribute_controller = None
+        # The attribute controller is optional; ImageAcquirer destruction
+        # must not depend on whether the device exposes a node map.
+        if self._widget_attribute_controller:
+            if self._widget_attribute_controller.isVisible():
+                self._widget_attribute_controller.close()
+            self._widget_attribute_controller = None
 
-            # Discard the image acquisition manager.
-            if self.ia:
-                self.ia.destroy()
-                self._ia = None
+        if self.ia is not None:
+            if self._thread_statistics_measurement.is_running():
+                self._thread_statistics_measurement.stop()
+
+            self.canvas.release_buffers()
+            try:
+                if self.ia.is_acquiring():
+                    self.ia.stop()
+            finally:
+                image_acquirer = self.ia
+                self.canvas.ia = None
+                try:
+                    image_acquirer.destroy()
+                finally:
+                    self._ia = None
+                    self.canvas.pause_drawing(False)
+                    self.update_statistics('')
 
     def action_on_select_file(self):
         # Show a dialog and update the CTI file list.
@@ -574,11 +604,11 @@ class Harvester(QMainWindow):
             if self.canvas.is_pausing():
                 self.canvas.resume_drawing()
         else:
-            # Start statistics measurement:
+            # Start a fresh statistics session and then start acquisition.
             self.ia.statistics.reset()
-            self._thread_statistics_measurement.start()
-
+            self.canvas.reset_statistics()
             self.ia.start()
+            self._thread_statistics_measurement.start()
 
     def is_enabled_on_start_image_acquisition(self):
         enable = False
@@ -590,18 +620,18 @@ class Harvester(QMainWindow):
         return enable
 
     def action_on_stop_image_acquisition(self):
-        # Stop statistics measurement:
-        self._thread_statistics_measurement.stop()
+        if self.ia is None:
+            return
 
-        # Release the preserved buffers, which the we kept chunk data alive,
-        # before stopping image acquisition. Otherwise the preserved buffers
-        # will be dangling after stopping image acquisition:
+        # Stop statistics measurement before stopping acquisition.
+        if self._thread_statistics_measurement.is_running():
+            self._thread_statistics_measurement.stop()
+
+        # Release preserved buffers before stopping acquisition.
         self.canvas.release_buffers()
-
-        # Then we stop image acquisition:
         self.ia.stop()
 
-        # Initialize the drawing state:
+        # Restore normal drawing state.
         self.canvas.pause_drawing(False)
 
     def is_enabled_on_stop_image_acquisition(self):
@@ -640,25 +670,55 @@ class Harvester(QMainWindow):
         self.about.show()
 
     def _worker_update_statistics(self):
-        #
-        if self.ia is None:
+        ia = self.ia
+        if ia is None:
             return
 
-        #
+        def get_node_value(name):
+            try:
+                return getattr(ia.remote_device.node_map, name).value
+            except (AttributeError, RuntimeError, ValueError):
+                return '?'
+
         message_config = 'W: {0} x H: {1}, {2}, '.format(
-            self.ia.remote_device.node_map.Width.value,
-            self.ia.remote_device.node_map.Height.value,
-            self.ia.remote_device.node_map.PixelFormat.value
+            get_node_value('Width'),
+            get_node_value('Height'),
+            get_node_value('PixelFormat')
         )
-        #
-        message_statistics = '{0:.1f} fps, elapsed {1}, {2} images'.format(
-            self.ia.statistics.fps,
-            str(datetime.timedelta(
-                seconds=int(self.ia.statistics.elapsed_time_s)
-            )),
-            self.ia.statistics.num_images
+
+        # Keep the original FPS statistic.
+        display_fps = self.canvas.get_display_fps()
+
+        # Acquisition FPS and bandwidth.
+        (
+            acq_fps,
+            min_acq_fps,
+            max_acq_fps,
+            bandwidth,
+            min_bandwidth,
+            max_bandwidth
+        ) = self.canvas.get_statistics()
+
+        elapsed = ia.statistics.elapsed_time_s
+        num_images = ia.statistics.num_images
+
+        message_statistics = (
+            'Display FPS: {0:.1f}, '
+            'Acq. FPS: {1:.1f} (Min: {2:.1f}, Max: {3:.1f}), '
+            'BW: {4:.2f} MB/s (Min: {5:.2f}, Max: {6:.2f}), '
+            'Elapsed: {7}, {8} Images'
+        ).format(
+            display_fps,
+            acq_fps,
+            min_acq_fps,
+            max_acq_fps,
+            bandwidth,
+            min_bandwidth,
+            max_bandwidth,
+            str(datetime.timedelta(seconds=int(elapsed))),
+            num_images
         )
-        #
+
         self._signal_update_statistics.emit(
             message_config + message_statistics
         )

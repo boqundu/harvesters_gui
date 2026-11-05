@@ -290,27 +290,32 @@ class FeatureTreeModel(QAbstractItemModel):
 
     def setData(self, index: QModelIndex, value, role=Qt.EditRole):
         if role == Qt.EditRole:
-            # TODO: Check the type of the target and convert the given value.
-            self.dataChanged.emit(index, index)
-
-            #
             tree_item = index.internalPointer()
             feature = tree_item.own_data[0]
             interface_type = feature.node.principal_interface_type
+
             try:
                 if interface_type == EInterfaceType.intfICommand:
                     if value:
                         feature.execute()
                 elif interface_type == EInterfaceType.intfIBoolean:
-                    feature.value = True if value.lower() == 'true' else False
+                    if isinstance(value, bool):
+                        feature.value = value
+                    else:
+                        feature.value = str(value).strip().lower() in (
+                            'true', '1', 'yes', 'on'
+                        )
                 elif interface_type == EInterfaceType.intfIFloat:
                     feature.value = float(value)
                 else:
                     feature.value = value
-                return True
-            except:
-                # TODO: Specify appropriate exceptions
+            except Exception:
+                # A rejected GenICam value must not terminate the GUI.
                 return False
+
+            # Notify the view only after the feature has been updated.
+            self.dataChanged.emit(index, index)
+            return True
 
 
 class FeatureEditDelegate(QStyledItemDelegate):
@@ -481,7 +486,12 @@ class FilterProxyModel(QSortFilterProxyModel):
                     return True
             return False
         else:
-            matches = re.search(self._keyword, name, re.IGNORECASE)
+            try:
+                matches = re.search(self._keyword, name, re.IGNORECASE)
+            except re.error:
+                # An incomplete/invalid regular expression is common while
+                # the user is typing; simply show no matches.
+                return False
 
         if matches:
             result = self.filterVisibility(visibility)

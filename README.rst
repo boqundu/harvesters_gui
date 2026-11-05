@@ -123,6 +123,8 @@ The main features of Harvester GUI are listed as follows:
 * Image data visualization of the acquired images
 * Image magnification using a mouse wheel or a trackpad
 * Image dragging using a mouse or a trackpad
+* Automatic image fitting when the window is resized, while preserving the image aspect ratio
+* Live acquisition frame-rate and payload-bandwidth statistics, including session minimum and maximum values
 * An arbitrary selection of image displaying point in the data path (Not implemented yet)
 
 Unlike Harvester, Harvester GUI limits the number of GenTL Producers to load just one. This is just a limitation to not make the GUI complicated. In general, the user should know which GenTL Producer should be loaded to control his target remote device. It's not necessary to load multiple GenTL Producers for this use case. However, this is just an idea in an early stage. We might support multiple loading on even Harvester GUI in the future.
@@ -279,6 +281,16 @@ Changing the part being displayed
 ---------------------------------
 
 If you're using a mouse, grab any point in the canvas and drag the pointer as if you're physically grabbing the image. The image will follow the pointer. If you are using a trackpad on a macOS, it might be useful if you assign the three finger slide for dragging.
+
+Fitting the image to the window
+-------------------------------
+
+When the window is resized, the image is automatically scaled to fit the available canvas area. The original aspect ratio is preserved, so the image is not stretched. Using the mouse wheel to zoom switches to manual magnification; the existing zoom and drag operations remain available.
+
+Acquisition statistics
+----------------------
+
+The status bar reports the current frame rate and payload bandwidth, together with the minimum and maximum values observed during the current acquisition session. Bandwidth is displayed in decimal MB/s and is calculated from the payload bytes of fetched buffers. The statistics are reset whenever a new acquisition session starts. The canvas drains all currently available buffers on each refresh, so the displayed statistics are not limited to the configured canvas refresh rate.
 
 ***************************
 Attribute controller window

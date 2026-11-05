@@ -29,7 +29,11 @@ from PyQt5.QtWidgets import QDialog, QApplication, QPlainTextEdit, \
     QTextEdit
 
 # Local application/library specific imports
-from harvesters.__init__ import __version__
+# Note: import from the package itself; the "from harvesters.__init__
+# import ..." form confuses PyInstaller's module graph, which then
+# looks for a non-existent harvesters.__init__ package in the frozen
+# application.
+from harvesters import __version__
 from harvesters_gui._helper import get_package_root
 from harvesters_gui._private.frontend.pyqt5.helper import get_system_font
 

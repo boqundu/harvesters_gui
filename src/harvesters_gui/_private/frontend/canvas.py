@@ -43,6 +43,7 @@ from harvesters.util.pfnc import mono_location_formats, \
     rgb_formats, bgr_formats, \
     rgba_formats, bgra_formats, \
     bayer_location_formats
+from harvesters.util.bayer import cfa_positions, demosaic
 
 
 class CanvasBase(app.Canvas):
@@ -410,6 +411,11 @@ class Canvas2D(CanvasBase):
         PAYLOADTYPE_INFO_IDS.PAYLOAD_TYPE_CHUNK_DATA,
         PAYLOADTYPE_INFO_IDS.PAYLOAD_TYPE_MULTI_PART,
     ]
+    # Also draw GenDC payloads; genicam < 1.6 does not define the type:
+    _visible_payloads.extend(
+        v for v in (
+            getattr(PAYLOADTYPE_INFO_IDS, 'PAYLOAD_TYPE_GENDC', None),)
+        if v is not None)
 
     def __init__(
             self, *,
@@ -452,9 +458,58 @@ class Canvas2D(CanvasBase):
         self._fragment_shader = """
             varying vec2 v_texcoord;
             uniform sampler2D texture;
+
+            // Bayer CFA demosaicing on the GPU; enabled per frame:
+            uniform bool u_demosaic;
+            uniform vec2 u_size;
+            uniform ivec2 u_red_pos;
+            uniform ivec2 u_blue_pos;
+
+            float tap(vec2 t)
+            {
+                // Sample the exact center of texel t; the texture uses
+                // edge clamping so the border replicates its edges:
+                return texture2D(texture, (t + 0.5) / u_size).r;
+            }
+
             void main()
             {
-                gl_FragColor = texture2D(texture, v_texcoord);
+                if (!u_demosaic) {
+                    gl_FragColor = texture2D(texture, v_texcoord);
+                    return;
+                }
+
+                // The texel that this fragment is about to cover:
+                vec2 texel = floor(v_texcoord * u_size);
+                float c = tap(texel);
+                float l = tap(texel + vec2(-1.0, 0.0));
+                float r = tap(texel + vec2( 1.0, 0.0));
+                float u = tap(texel + vec2(0.0, -1.0));
+                float d = tap(texel + vec2(0.0,  1.0));
+                float ul = tap(texel + vec2(-1.0, -1.0));
+                float ur = tap(texel + vec2( 1.0, -1.0));
+                float dl = tap(texel + vec2(-1.0,  1.0));
+                float dr = tap(texel + vec2( 1.0,  1.0));
+                ivec2 ip = ivec2(mod(texel, 2.0));
+
+                float rr;
+                if (ip == u_red_pos) { rr = c; }
+                else if (ip.y == u_red_pos.y) { rr = (l + r) * 0.5; }
+                else if (ip.x == u_red_pos.x) { rr = (u + d) * 0.5; }
+                else { rr = (ul + ur + dl + dr) * 0.25; }
+
+                float bb;
+                if (ip == u_blue_pos) { bb = c; }
+                else if (ip.y == u_blue_pos.y) { bb = (l + r) * 0.5; }
+                else if (ip.x == u_blue_pos.x) { bb = (u + d) * 0.5; }
+                else { bb = (ul + ur + dl + dr) * 0.25; }
+
+                float gg;
+                if (ip == u_red_pos || ip == u_blue_pos) {
+                    gg = (l + r + u + d) * 0.25;
+                } else { gg = c; }
+
+                gl_FragColor = vec4(rr, gg, bb, 1.0);
             }
         """
 
@@ -496,6 +551,12 @@ class Canvas2D(CanvasBase):
         self._program['texture'] = np.zeros(
             (self._height, self._width), dtype='uint8'
         )
+
+        # Demosaicing is off until a Bayer image is uploaded:
+        self._program['u_demosaic'] = False
+        self._program['u_size'] = (self._width, self._height)
+        self._program['u_red_pos'] = (0, 0)
+        self._program['u_blue_pos'] = (1, 1)
 
         #
         self.apply_magnification()
@@ -575,7 +636,37 @@ class Canvas2D(CanvasBase):
                 # Then cast each array element to an uint8:
                 content = content.astype(np.uint8)
 
+            if data_format in bayer_location_formats and exponent == 0:
+                # Upload the raw single-channel CFA image and let the
+                # GPU demosaic it per output pixel while rendering: the
+                # upload costs a third of an RGB image and the CPU is
+                # freed from the demosaicing work, keeping the display
+                # at the acquisition frame rate:
+                red_pos, blue_pos = cfa_positions(data_format)
+                self._program['u_demosaic'] = True
+                self._program['u_size'] = (width, height)
+                self._program['u_red_pos'] = red_pos
+                self._program['u_blue_pos'] = blue_pos
+                self._set_texture_interpolation('nearest')
+            else:
+                self._program['u_demosaic'] = False
+                self._set_texture_interpolation('linear')
+                if data_format in bayer_location_formats:
+                    # A more-than-8-bit Bayer image is demosaiced on
+                    # the CPU after the 8-bit conversion; the GPU path
+                    # above only handles 8-bit inputs:
+                    content = demosaic(content, data_format)
+
             self._program['texture'] = content
+
+    def _set_texture_interpolation(self, mode):
+        #
+        try:
+            self._program['texture'].interpolation = mode
+        except (AttributeError, KeyError, TypeError):
+            # The shader samples exact texel centers so even without
+            # switching the interpolation the demosaicing stays exact:
+            pass
 
     def _draw(self):
         self._program.draw('triangle_strip')

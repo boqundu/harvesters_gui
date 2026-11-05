@@ -11,6 +11,25 @@
 
 ----
 
+##############################################
+Changes in This Fork (vs. upstream 1.0.2)
+##############################################
+
+*2026-11 · 配套核心库改动见 harvesters fork（GenDC 载荷支持）。*
+
+新增功能
+========
+
+- **GenDC 图像显示**：画布可见载荷白名单加入 ``PAYLOAD_TYPE_GENDC (11)``，配合本地 harvesters fork 的 ``PayloadGenDC``，直接显示 GenDC 容器内的 2D 图像组件。
+- **Bayer 彩色显示（GPU 去马赛克）**：片元着色器逐输出像素双线性插值（uniform：``u_demosaic`` / ``u_size`` / ``u_red_pos`` / ``u_blue_pos``），CPU 只上传单通道纹理。24.5 MP BayerRG8 实测：CPU 方案 385 ms/帧（≈2.6 fps）且上传 73 MB/帧，GPU 方案 CPU 成本≈0、上传 24.5 MB/帧，显示帧率恢复到与采集帧率一致。>8 bit Bayer 自动回退 CPU 去马赛克；Mono/RGB 等原有路径不受影响。
+
+缺陷修复
+========
+
+- **相机被其他程序占用时连接闪退**：原代码只捕获 7 种特定 GenTL 异常，其余异常逃逸 Qt 槽函数触发 PyQt5 ``qFatal`` 中止进程；现改为广捕 ``Exception`` 并弹出 "Connection failed" 对话框（含"设备可能已被占用"提示），GUI 保持存活。
+- **全局异常兜底**：launcher 安装 ``sys.excepthook``，未处理异常打印堆栈并弹窗提示，而非直接退出进程。
+- **启动警告清理**：About 对话框非法 QSS ``rgb(0, 0, 0, 0%)`` → ``transparent``（消除 7 条 QCssParser 警告）；弃用 API ``add_cti_file()`` / ``cti_files`` → ``add_file()`` / ``files``。
+
 ######################
 What Is Harvester GUI?
 ######################

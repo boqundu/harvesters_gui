@@ -28,12 +28,8 @@ import time
 from PyQt5.QtCore import QMutexLocker, QMutex, pyqtSignal, QThread
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import QMainWindow, QAction, QComboBox, \
-    QDesktopWidget, QFileDialog, QDialog, QShortcut, QApplication
-
-from genicam.gentl import NotInitializedException, InvalidHandleException, \
-    InvalidIdException, ResourceInUseException, \
-    InvalidParameterException, NotImplementedException, \
-    AccessDeniedException
+    QDesktopWidget, QFileDialog, QDialog, QShortcut, QApplication, \
+    QMessageBox
 
 # Local application/library specific imports
 from harvesters.core import Harvester as HarvesterCore, ParameterSet, ParameterKey
@@ -163,7 +159,7 @@ class Harvester(QMainWindow):
 
     @property
     def cti_files(self):
-        return self.harvester_core.cti_files
+        return self.harvester_core.files
 
     @property
     def harvester_core(self):
@@ -493,13 +489,17 @@ class Harvester(QMainWindow):
                 self.device_list.currentIndex(), config=config)
             # We want to hold one buffer to keep the chunk data alive:
             self._ia.num_buffers += 1
-        except (
-            NotInitializedException, InvalidHandleException,
-            InvalidIdException, ResourceInUseException,
-            InvalidParameterException, NotImplementedException,
-            AccessDeniedException,
-        ) as e:
+        except Exception as e:
+            # The GenTL producer may raise any error here, for example
+            # when the device is already owned by another application.
+            # Keep the GUI alive and tell the user; an exception that
+            # escapes a Qt slot would abort the whole process:
             self._logger.error(e, exc_info=True)
+            QMessageBox.critical(
+                self, 'Connection failed',
+                'Could not connect to the device.\n\n{}\n\n'
+                'Hint: the device may already be opened by another '
+                'application. Close it and try again.'.format(e))
 
         if not self._ia:
             # The device is not available.
@@ -569,7 +569,7 @@ class Harvester(QMainWindow):
             self.harvester_core.reset()
 
             # Update the path to the target GenTL Producer.
-            self.harvester_core.add_cti_file(file_path)
+            self.harvester_core.add_file(file_path)
 
             # Update the device list.
             self.harvester_core.update()

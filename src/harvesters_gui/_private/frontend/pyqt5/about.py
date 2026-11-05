@@ -57,7 +57,7 @@ class TransparentLineEdit(QLineEdit):
 
         self.setReadOnly(True)
         self.setFont(get_system_font())
-        self.setStyleSheet('background: rgb(0, 0, 0, 0%)')
+        self.setStyleSheet('background: transparent')
         self.setFrame(False)
 
 
@@ -68,7 +68,7 @@ class TransparentTextEdit(QTextEdit):
 
         self.setReadOnly(True)
         self.setFont(get_system_font())
-        self.setStyleSheet('background: rgb(0, 0, 0, 0%)')
+        self.setStyleSheet('background: transparent')
         self.setLineWrapMode(True)
         self.setFrameStyle(QFrame.NoFrame)
         self.setAlignment(Qt.AlignCenter)

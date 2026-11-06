@@ -585,9 +585,7 @@ class Harvester(QMainWindow):
                     '- The GenTL producer failed to load (missing VC++ '
                     'x64 redistributable, missing camera SDK/driver, or '
                     'the CTI file was copied without its sibling DLLs).\n'
-                    '- The camera is not connected or not powered.\n\n'
-                    'Run the diagnostic tool for details:\n'
-                    'tools\\probe_gendc.py --cti <path-to-producer.cti>'
+                    '- The camera is not connected or not powered.'
                     ''.format(file_path))
 
     def is_enabled_on_select_file(self):

@@ -574,6 +574,22 @@ class Harvester(QMainWindow):
             # Update the device list.
             self.harvester_core.update()
 
+            # A producer that fails to load is only logged by the core
+            # library; tell the user instead of failing silently:
+            if not self.harvester_core.device_info_list:
+                QMessageBox.warning(
+                    self, 'No device found',
+                    'No device was found after loading the CTI file:\n'
+                    '\n{}\n\n'
+                    'Possible causes:\n'
+                    '- The GenTL producer failed to load (missing VC++ '
+                    'x64 redistributable, missing camera SDK/driver, or '
+                    'the CTI file was copied without its sibling DLLs).\n'
+                    '- The camera is not connected or not powered.\n\n'
+                    'Run the diagnostic tool for details:\n'
+                    'tools\\probe_gendc.py --cti <path-to-producer.cti>'
+                    ''.format(file_path))
+
     def is_enabled_on_select_file(self):
         enable = False
         if self.ia is None:

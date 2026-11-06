@@ -35,12 +35,12 @@ log.info('Entered setup.py')
 log.info('$PATH=%s' % os.environ.get('PATH', ''))
 
 
-# Check the Python version:
-supported_versions = [(3, 5), (3, 6), (3, 7), (3, 8)]
-if tuple(sys.version_info[:2]) not in supported_versions:
+# Check the Python version: genicam >= 1.6 (a hard requirement of this
+# fork) provides wheels for Python 3.10 through 3.14:
+if sys.version_info < (3, 10):
     raise RuntimeError(
         'Unsupported Python version: {0}.{1}. '
-        'Harvester GUI requires Python >= 3.5 and < 3.9. '
+        'Harvester GUI requires Python >= 3.10. '
         'See https://github.com/genicam/harvesters_gui#requirements'.format(
             sys.version_info.major, sys.version_info.minor
         )
@@ -74,10 +74,11 @@ setuptools.setup(
         'Operating System :: MacOS :: MacOS X',
         'Operating System :: Microsoft :: Windows',
         'Operating System :: POSIX',
-        'Programming Language :: Python :: 3.5',
-        'Programming Language :: Python :: 3.6',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.13',
+        'Programming Language :: Python :: 3.14',
     ),
     # A short, on-sentence summary of the package:
     description=description,
@@ -85,10 +86,16 @@ setuptools.setup(
     download_url='https://pypi.org/project/harvesters_gui/',
     # A list of required Python modules:
     install_requires=[
-        'PyQt5<=5.13',
-        'vispy<=0.6',
-        'harvesters>=1.1',
+        'PyQt5>=5.15',
+        'vispy>=0.17',
+        'harvesters>=1.4.3',
+        # canvas.py gates the visible payload types on
+        # PAYLOADTYPE_INFO_IDS.PAYLOAD_TYPE_GENDC, which only exists in
+        # genicam >= 1.6:
+        'genicam>=1.6',
     ],
+    # genicam 1.6 provides wheels for Python 3.10 through 3.14 only:
+    python_requires='>=3.10',
 
     license='Apache Software License V2.0',
     # A detailed description of the package:

@@ -410,12 +410,10 @@ class Canvas2D(CanvasBase):
         PAYLOADTYPE_INFO_IDS.PAYLOAD_TYPE_IMAGE,
         PAYLOADTYPE_INFO_IDS.PAYLOAD_TYPE_CHUNK_DATA,
         PAYLOADTYPE_INFO_IDS.PAYLOAD_TYPE_MULTI_PART,
+        # Also draw GenDC payloads; the installed genicam must define
+        # the type, i.e. genicam >= 1.6 is a hard requirement:
+        PAYLOADTYPE_INFO_IDS.PAYLOAD_TYPE_GENDC,
     ]
-    # Also draw GenDC payloads; genicam < 1.6 does not define the type:
-    _visible_payloads.extend(
-        v for v in (
-            getattr(PAYLOADTYPE_INFO_IDS, 'PAYLOAD_TYPE_GENDC', None),)
-        if v is not None)
 
     def __init__(
             self, *,

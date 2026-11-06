@@ -32,6 +32,14 @@ Changes in This Fork (vs. upstream 1.0.2)
 - **全局异常兜底**：launcher 安装 ``sys.excepthook``，未处理异常打印堆栈并弹窗提示，而非直接退出进程。
 - **启动警告清理**：About 对话框非法 QSS ``rgb(0, 0, 0, 0%)`` → ``transparent``（消除 7 条 QCssParser 警告）；弃用 API ``add_cti_file()`` / ``cti_files`` → ``add_file()`` / ``files``。
 
+**********
+运行环境
+**********
+
+- **Python ≥ 3.10** （ ``python_requires`` 已声明；genicam 1.6 的 wheel 覆盖 cp310-cp314），已在 3.10 与 3.14 双端实测。
+- 依赖： ``genicam>=1.6`` （ ``PAYLOAD_TYPE_GENDC`` 为硬依赖）、 ``PyQt5>=5.15`` 、 ``vispy>=0.17`` ，配套本地 harvesters fork。
+- 部署：项目根目录 ``run_gui.bat`` 使用 ``.venv`` （conda 布局 Python 3.10）并通过 PYTHONPATH 优先加载两个本地 src；诊断与打包脚本见项目根目录 ``tools\`` 。
+
 ----
 
 ######################

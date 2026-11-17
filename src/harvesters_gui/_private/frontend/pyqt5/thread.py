@@ -97,7 +97,14 @@ class _ThreadImpl(QThread):
         while self._base.is_running():
             if self._worker:
                 self._worker()
-                # Force the current thread to sleep for some microseconds:
+            # The fetch worker of the core blocks on the GenTL event
+            # wait by itself, so a cycle of zero or less disables the
+            # pacing. On Windows QThread.usleep maps to
+            # Sleep(usecs / 1000 + 1), whose granularity is the system
+            # timer tick (~15.6 ms by default); sleeping for even one
+            # microsecond would pace the loop at ~64 iterations per
+            # second and the camera-side buffer pool would overflow:
+            if self._update_cycle_us > 0:
                 self.usleep(self._update_cycle_us)
 
     def acquire(self):

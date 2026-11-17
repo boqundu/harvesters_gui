@@ -22,6 +22,7 @@
 
 # Related third party imports
 
+import os
 import time
 import threading
 
@@ -110,6 +111,13 @@ class CanvasBase(app.Canvas):
         self._display_last_time = None
         self._display_interval_frames = 0
         self._display_fps = 0.0
+        # Per-draw phase profiling, enabled with HARVESTER_STATS_DEBUG:
+        self._profile_enabled = 'HARVESTER_STATS_DEBUG' in os.environ
+        self._profile_frames = 0
+        self._profile_fetch_s = 0.0
+        self._profile_prepare_s = 0.0
+        self._profile_draw_s = 0.0
+        self._profile_renderer_printed = False
         # Fit the complete image into the available canvas until the user
         # changes magnification manually.
         self._fit_to_window = True
@@ -300,13 +308,41 @@ class CanvasBase(app.Canvas):
             # drawing is paused.
             self.release_buffers()
 
+        profile_start = time.perf_counter() if self._profile_enabled else 0.0
+
+        if self._profile_enabled and not self._profile_renderer_printed:
+            # The GL context belongs to the main thread, so the renderer
+            # can only be queried here and not from the statistics
+            # thread. Queried through Qt: the vispy gloo module of this
+            # vispy version does not expose the raw GL queries.
+            self._profile_renderer_printed = True
+            renderer = version = '?'
+            try:
+                from PyQt5.QtGui import QOpenGLContext
+                context = QOpenGLContext.currentContext()
+                if context is not None:
+                    functions = context.functions()
+                    gl_renderer = functions.glGetString(0x1F01)   # GL_RENDERER
+                    gl_version = functions.glGetString(0x1F02)   # GL_VERSION
+                    renderer = bytes(gl_renderer).decode(errors='replace')
+                    version = bytes(gl_version).decode(errors='replace')
+            except Exception as e:
+                renderer = 'query failed: {}'.format(e)
+            print('[gui-stats] GL renderer:', renderer,
+                  '| GL version:', version, flush=True)
+
         # Drain all buffers currently available. Otherwise a 30/60 Hz display
         # loop can silently limit the measured/consumed frame rate of a faster
-        # camera and let the input queue grow.
+        # camera and let the input queue grow. The internal queue of the
+        # core holds at most the latest buffer (the fetch worker requeues
+        # the older ones), so this loop drains at most one buffer and
+        # then exits on the timeout; cycle_s=0 keeps the wait non-sleeping
+        # because a sleep of even one millisecond rounds up to a system
+        # timer tick on Windows and would stall the main thread:
         try:
             while self.ia is not None:
                 try:
-                    buffer = self.ia.fetch(timeout=0.0001)
+                    buffer = self.ia.fetch(timeout=0.0001, cycle_s=0)
                 except TimeoutException:
                     break
 
@@ -326,9 +362,18 @@ class CanvasBase(app.Canvas):
             # No ImageAcquirer is connected.
             pass
 
+        if self._profile_enabled:
+            profile_fetch = time.perf_counter() - profile_start
+        else:
+            profile_fetch = 0.0
+
         if latest_buffer is not None:
+            profile_prepare_start = \
+                time.perf_counter() if self._profile_enabled else 0.0
             try:
                 self._prepare_texture(latest_buffer)
+                profile_draw_start = \
+                    time.perf_counter() if self._profile_enabled else 0.0
                 self._draw()
                 drew = True
                 # Count only successfully displayed images.
@@ -341,9 +386,33 @@ class CanvasBase(app.Canvas):
                 # data remains valid for the texture's lifetime.
                 self.release_buffers()
                 self._buffers.append(latest_buffer)
+                if self._profile_enabled:
+                    profile_done = time.perf_counter()
+                    self._profile_frames += 1
+                    self._profile_fetch_s += profile_fetch
+                    self._profile_prepare_s += \
+                        profile_draw_start - profile_prepare_start
+                    self._profile_draw_s += \
+                        profile_done - profile_draw_start
+        else:
+            if self._profile_enabled:
+                self._profile_fetch_s += profile_fetch
 
-        if not drew:
-            self._draw()
+    def get_draw_profile(self):
+        #
+        # Average duration of the fetch and of the texture-preparation
+        # and drawing phases over the draws accumulated since the
+        # previous call, in milliseconds.
+        #
+        frames = self._profile_frames
+        fetch_ms = self._profile_fetch_s * 1000.0 / max(frames, 1)
+        prepare_ms = self._profile_prepare_s * 1000.0 / max(frames, 1)
+        draw_ms = self._profile_draw_s * 1000.0 / max(frames, 1)
+        self._profile_frames = 0
+        self._profile_fetch_s = 0.0
+        self._profile_prepare_s = 0.0
+        self._profile_draw_s = 0.0
+        return fetch_ms, prepare_ms, draw_ms, frames
 
     def release_buffers(self):
         for _buffer in self._buffers:

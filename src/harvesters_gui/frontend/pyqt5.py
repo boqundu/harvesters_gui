@@ -25,6 +25,7 @@ import sys
 import time
 
 # Related third party imports
+import psutil
 from PyQt5.QtCore import QMutexLocker, QMutex, pyqtSignal, QThread
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import QMainWindow, QAction, QComboBox, \
@@ -33,6 +34,7 @@ from PyQt5.QtWidgets import QMainWindow, QAction, QComboBox, \
 
 # Local application/library specific imports
 from harvesters.core import Harvester as HarvesterCore, ParameterSet, ParameterKey
+from harvesters.util.buffer_policy import compute_num_buffers
 from harvesters_gui._private.frontend.canvas import Canvas2D
 from harvesters_gui._private.frontend.helper import compose_tooltip
 from harvesters_gui._private.frontend.pyqt5.about import About
@@ -44,6 +46,19 @@ from harvesters_gui._private.frontend.pyqt5.helper import get_system_font
 from harvesters_gui._private.frontend.pyqt5.icon import Icon
 from harvesters_gui._private.frontend.pyqt5.thread import _PyQtThread
 from harvesters.util.logging import get_logger
+
+
+def read_node_value(node_map, name):
+    #
+    # Reads the value of one of the remote device's nodes; a node that
+    # the device does not implement is reported as '?' instead of
+    # raising, so that the callers can keep their display and sizing
+    # logic simple.
+    #
+    try:
+        return getattr(node_map, name).value
+    except (AttributeError, RuntimeError, ValueError):
+        return '?'
 
 
 class Harvester(QMainWindow):
@@ -61,6 +76,9 @@ class Harvester(QMainWindow):
         #
         self._mutex = QMutex()
 
+        self._debug_stats = 'HARVESTER_STATS_DEBUG' in os.environ
+        self._debug_previous_images = None
+
         profile = True if 'HARVESTER_PROFILE' in os.environ else False
         self._harvester_core = HarvesterCore(
             profile=profile, logger=self._logger
@@ -68,6 +86,12 @@ class Harvester(QMainWindow):
         self._ia = None  # Image Acquirer
 
         #
+        # Vertical sync can be turned off with HARVESTER_VSYNC=0 for
+        # diagnostics; a blocked swap shows up directly in the frame
+        # rate of the display:
+        #
+        if os.environ.get('HARVESTER_VSYNC') == '0':
+            vsync = False
         self._widget_canvas = Canvas2D(vsync=vsync)
         self._widget_canvas.create_native()
         self._widget_canvas.native.setParent(self)
@@ -480,15 +504,17 @@ class Harvester(QMainWindow):
 
     def action_on_connect(self):
         #
+        # The fetch worker runs unpaced; it blocks on the GenTL
+        # new-buffer event wait by itself. See the thread implementation
+        # for why the worker must not sleep between two fetches:
+        #
         config = ParameterSet({
             ParameterKey.THREAD_FACTORY_METHOD: lambda: _PyQtThread(
-                parent=self, mutex=self._mutex),
+                parent=self, mutex=self._mutex, update_cycle_us=0),
         })
         try:
             self._ia = self.harvester_core.create(
                 self.device_list.currentIndex(), config=config)
-            # We want to hold one buffer to keep the chunk data alive:
-            self._ia.num_buffers += 1
         except Exception as e:
             # The GenTL producer may raise any error here, for example
             # when the device is already owned by another application.
@@ -517,8 +543,67 @@ class Harvester(QMainWindow):
         except AttributeError:
             pass
 
-        #
         self.canvas.ia = self.ia
+
+        #
+        # Size the acquisition buffer queue before the first start;
+        # a small pool cannot absorb the stalls of the display loop:
+        # while the canvas is busy building a frame on the main
+        # thread, the producer runs out of free buffers and drops
+        # frames, which caps the delivered frame rate at the display
+        # cadence:
+        #
+        self._configure_buffers()
+
+    def _configure_buffers(self):
+        #
+        # A queue of only a few buffers drops frames as soon as the
+        # delivery or the scheduling stumbles for a moment, and the
+        # frame rate collapses with it. Announce ten buffers by
+        # default, as many more as the memory that is currently
+        # available on the host allows, and fewer only when that
+        # memory cannot pay for the default; the buffers are
+        # allocated when the acquisition starts and are freed when it
+        # stops. The policy itself is in compute_num_buffers and is
+        # covered by unit tests.
+        #
+        ia = self.ia
+        if ia is None:
+            return
+
+        try:
+            payload_size = int(read_node_value(
+                ia.remote_device.node_map, 'PayloadSize'))
+        except (TypeError, ValueError):
+            payload_size = 0
+
+        num_buffers = compute_num_buffers(
+            payload_size, psutil.virtual_memory().available
+        )
+        try:
+            # The GenTL producer may require more buffers than the
+            # policy announces; its requirement wins:
+            num_buffers = max(num_buffers, ia.min_num_buffers)
+            ia.num_buffers = num_buffers
+            self._logger.info(
+                'configured {0} acquisition buffers '
+                '(payload: {1} bytes, available memory: {2} bytes)'
+                ''.format(
+                    num_buffers, payload_size,
+                    psutil.virtual_memory().available)
+            )
+            if self._debug_stats:
+                print(
+                    '[gui-stats] configured {0} acquisition buffers '
+                    '(payload: {1} bytes)'.format(num_buffers, payload_size),
+                    flush=True
+                )
+        except Exception as e:
+            # Keep the producer's default rather than losing the
+            # connection over a sizing disagreement:
+            self._logger.warning(
+                'failed to set the number of buffers: {}'.format(e)
+            )
 
     def is_enabled_on_connect(self):
         enable = False
@@ -621,7 +706,10 @@ class Harvester(QMainWindow):
             # Start a fresh statistics session and then start acquisition.
             self.ia.statistics.reset()
             self.canvas.reset_statistics()
-            self.ia.start()
+            # Fetch buffers on the internal worker thread so that
+            # acquisition is paced by the camera, not by the GUI display
+            # loop; the canvas only consumes the internal buffer queue:
+            self.ia.start(run_as_thread=True)
             self._thread_statistics_measurement.start()
 
     def is_enabled_on_start_image_acquisition(self):
@@ -688,38 +776,73 @@ class Harvester(QMainWindow):
         if ia is None:
             return
 
-        def get_node_value(name):
-            try:
-                return getattr(ia.remote_device.node_map, name).value
-            except (AttributeError, RuntimeError, ValueError):
-                return '?'
+        node_map = ia.remote_device.node_map
 
         message_config = 'W: {0} x H: {1}, {2}, '.format(
-            get_node_value('Width'),
-            get_node_value('Height'),
-            get_node_value('PixelFormat')
+            read_node_value(node_map, 'Width'),
+            read_node_value(node_map, 'Height'),
+            read_node_value(node_map, 'PixelFormat')
         )
 
         # Keep the original FPS statistic.
         display_fps = self.canvas.get_display_fps()
 
-        # Acquisition FPS and bandwidth.
-        (
-            acq_fps,
-            min_acq_fps,
-            max_acq_fps,
-            bandwidth,
-            min_bandwidth,
-            max_bandwidth
-        ) = self.canvas.get_statistics()
+        # Acquisition FPS is measured from the device timestamps of the
+        # buffers fetched on the camera-paced worker thread, so it shows
+        # the actual delivery rate regardless of the display loop:
+        stats = ia.statistics
+        acq_fps = stats.fps or 0.0
+        min_acq_fps = stats.fps_min or 0.0
+        max_acq_fps = stats.fps_max or 0.0
 
-        elapsed = ia.statistics.elapsed_time_s
-        num_images = ia.statistics.num_images
+        #
+        # Diagnostics for the acquisition path; enable it by setting
+        # HARVESTER_STATS_DEBUG=1 before starting the GUI. One line per
+        # tick tells whether the event thread is alive and how many
+        # buffers it has delivered since the previous tick:
+        #
+        if self._debug_stats:
+            thread = getattr(ia, '_event_new_buffer_thread', None)
+            running = thread.is_running() if thread else 'n/a'
+            num_images = stats.num_images
+            previous = getattr(self, '_debug_previous_images', None)
+            self._debug_previous_images = num_images
+            delta = '?' if previous is None else '{0:d}'.format(
+                num_images - previous
+            )
+            print(
+                '[gui-stats] event_thread_running={0} '
+                'images=+{1} ({2} total) fps={3:.1f} display_fps={4:.1f} '
+                'draw[fetch={5:.1f}ms prepare={6:.1f}ms gl={7:.1f}ms '
+                'n={8}]'
+                ''.format(
+                    running, delta, num_images, acq_fps, display_fps,
+                    *self.canvas.get_draw_profile()
+                ),
+                flush=True
+            )
+
+        # Bandwidth estimated from the frame rate and the payload size,
+        # in megabits per second:
+        try:
+            payload_size = int(read_node_value(node_map, 'PayloadSize'))
+        except (TypeError, ValueError):
+            payload_size = 0
+
+        def bandwidth_mbps(fps):
+            return fps * payload_size * 8.0 / 1000000.0
+
+        bandwidth = bandwidth_mbps(acq_fps)
+        min_bandwidth = bandwidth_mbps(min_acq_fps)
+        max_bandwidth = bandwidth_mbps(max_acq_fps)
+
+        elapsed = stats.elapsed_time_s
+        num_images = stats.num_images
 
         message_statistics = (
             'Display FPS: {0:.1f}, '
             'Acq. FPS: {1:.1f} (Min: {2:.1f}, Max: {3:.1f}), '
-            'BW: {4:.2f} MB/s (Min: {5:.2f}, Max: {6:.2f}), '
+            'BW: {4:.2f} Mbps (Min: {5:.2f}, Max: {6:.2f}), '
             'Elapsed: {7}, {8} Images'
         ).format(
             display_fps,

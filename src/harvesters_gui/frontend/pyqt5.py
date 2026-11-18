@@ -30,7 +30,7 @@ from PyQt5.QtCore import QMutexLocker, QMutex, pyqtSignal, QThread
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import QMainWindow, QAction, QComboBox, \
     QDesktopWidget, QFileDialog, QDialog, QShortcut, QApplication, \
-    QMessageBox
+    QLabel, QMessageBox
 
 # Local application/library specific imports
 from harvesters.core import Harvester as HarvesterCore, ParameterSet, ParameterKey
@@ -41,6 +41,7 @@ from harvesters_gui._private.frontend.pyqt5.about import About
 from harvesters_gui._private.frontend.pyqt5.action import Action
 from harvesters_gui._private.frontend.pyqt5.attribute_controller import AttributeController
 from harvesters_gui._private.frontend.pyqt5.device_list import ComboBoxDeviceList
+from harvesters_gui._private.frontend.pyqt5.buffer_count import BufferCountSetting
 from harvesters_gui._private.frontend.pyqt5.display_rate_list import ComboBoxDisplayRateList
 from harvesters_gui._private.frontend.pyqt5.helper import get_system_font
 from harvesters_gui._private.frontend.pyqt5.icon import Icon
@@ -129,7 +130,7 @@ class Harvester(QMainWindow):
         self.action_stop_image_acquisition.execute()
 
     def update_statistics(self, message):
-        self.statusBar().showMessage(message)
+        self._status_label.setText(message)
 
     def closeEvent(self, event):
         # Stop the statistics worker before destroying the ImageAcquirer.
@@ -200,6 +201,11 @@ class Harvester(QMainWindow):
         #
         self.statusBar().showMessage('')
         self.statusBar().setFont(get_system_font())
+
+        #
+        # A permanent label for the status bar message:
+        self._status_label = QLabel()
+        self.statusBar().addPermanentWidget(self._status_label)
 
         #
         self._initialize_gui_toolbar(self._observer_widgets)
@@ -389,6 +395,18 @@ class Harvester(QMainWindow):
         observers.append(self._widget_display_rates)
 
         #
+        self._widget_buffer_count = BufferCountSetting(self)
+        self._widget_buffer_count.setToolTip(
+            'Number of acquisition buffers; the value takes effect at '
+            'the next acquisition start'
+        )
+        self._widget_buffer_count.setEnabled(False)
+        self._widget_buffer_count.value_changed.connect(
+            self._on_num_buffers_changed
+        )
+        group_display.addWidget(self._widget_buffer_count)
+
+        #
         self._widget_about = About(self)
         button_about = ActionShowAbout(
             icon='about.png', title='About', parent=self,
@@ -555,6 +573,13 @@ class Harvester(QMainWindow):
         #
         self._configure_buffers()
 
+        # Reflect the effective buffer count on the toolbar control;
+        # from here on the user can override the automatic policy:
+        self._widget_buffer_count.set_minimum(
+            max(1, self.ia.min_num_buffers))
+        self._widget_buffer_count.set_value(self.ia.num_buffers)
+        self._widget_buffer_count.setEnabled(True)
+
     def _configure_buffers(self):
         #
         # A queue of only a few buffers drops frames as soon as the
@@ -577,8 +602,12 @@ class Harvester(QMainWindow):
         except (TypeError, ValueError):
             payload_size = 0
 
+        # A deep pool actively harms the delivery at high frame rates:
+        # hundreds of outstanding USB transfers degrade the producer's
+        # submission path and the frames are lost in the wire. Keep the
+        # automatic queue modest; the toolbar control overrides it:
         num_buffers = compute_num_buffers(
-            payload_size, psutil.virtual_memory().available
+            payload_size, psutil.virtual_memory().available, maximum=30
         )
         try:
             # The GenTL producer may require more buffers than the
@@ -604,6 +633,21 @@ class Harvester(QMainWindow):
             self._logger.warning(
                 'failed to set the number of buffers: {}'.format(e)
             )
+
+    def _on_num_buffers_changed(self, value):
+        ia = self.ia
+        if ia is None:
+            return
+        try:
+            ia.num_buffers = value
+            self._logger.info(
+                'acquisition buffers set to {0}'.format(value))
+        except Exception as e:
+            # The producer rejected the value; restore the effective
+            # one:
+            self._logger.warning(
+                'failed to set the number of buffers: {}'.format(e))
+            self._widget_buffer_count.set_value(ia.num_buffers)
 
     def is_enabled_on_connect(self):
         enable = False
@@ -638,6 +682,7 @@ class Harvester(QMainWindow):
                     self._ia = None
                     self.canvas.pause_drawing(False)
                     self.update_statistics('')
+                    self._widget_buffer_count.setEnabled(False)
 
     def action_on_select_file(self):
         # Show a dialog and update the CTI file list.
@@ -712,6 +757,10 @@ class Harvester(QMainWindow):
             self.ia.start(run_as_thread=True)
             self._thread_statistics_measurement.start()
 
+            # The buffer count only takes effect at an acquisition
+            # start; make the control read-only while acquiring:
+            self._widget_buffer_count.setEnabled(False)
+
     def is_enabled_on_start_image_acquisition(self):
         enable = False
         if self.cti_files:
@@ -735,6 +784,9 @@ class Harvester(QMainWindow):
 
         # Restore normal drawing state.
         self.canvas.pause_drawing(False)
+
+        # The buffers have been freed; the count is editable again:
+        self._widget_buffer_count.setEnabled(True)
 
     def is_enabled_on_stop_image_acquisition(self):
         enable = False
@@ -787,9 +839,9 @@ class Harvester(QMainWindow):
         # Keep the original FPS statistic.
         display_fps = self.canvas.get_display_fps()
 
-        # Acquisition FPS is measured from the device timestamps of the
-        # buffers fetched on the camera-paced worker thread, so it shows
-        # the actual delivery rate regardless of the display loop:
+        # Acquisition FPS is the delivery rate measured on the
+        # camera-paced worker thread, so it shows the actual delivery
+        # rate regardless of the display loop:
         stats = ia.statistics
         acq_fps = stats.fps or 0.0
         min_acq_fps = stats.fps_min or 0.0
@@ -839,21 +891,30 @@ class Harvester(QMainWindow):
         elapsed = stats.elapsed_time_s
         num_images = stats.num_images
 
+        # Frames that never made it to the host, counted at the same
+        # site as the acquisition FPS through the gaps of the device
+        # frame id; the buffers the internal display queue replaces
+        # with newer frames are normal decimation, not lost frames:
+        lost = stats.num_images_lost or 0
+
+        # One line: the summary part and the detailed statistics part
+        # are separated by a wide blank span:
         message_statistics = (
-            'Display FPS: {0:.1f}, '
-            'Acq. FPS: {1:.1f} (Min: {2:.1f}, Max: {3:.1f}), '
-            'BW: {4:.2f} Mbps (Min: {5:.2f}, Max: {6:.2f}), '
-            'Elapsed: {7}, {8} Images'
+            'Display FPS: {0:.1f}, Elapsed: {1}, {2} Images, Lost: {3}'
+            '          '
+            'Acq. FPS: {4:.1f} (Min: {5:.1f}, Max: {6:.1f}), '
+            'BW: {7:.2f} Mbps (Min: {8:.2f}, Max: {9:.2f})'
         ).format(
             display_fps,
+            str(datetime.timedelta(seconds=int(elapsed))),
+            num_images,
+            lost,
             acq_fps,
             min_acq_fps,
             max_acq_fps,
             bandwidth,
             min_bandwidth,
-            max_bandwidth,
-            str(datetime.timedelta(seconds=int(elapsed))),
-            num_images
+            max_bandwidth
         )
 
         self._signal_update_statistics.emit(
